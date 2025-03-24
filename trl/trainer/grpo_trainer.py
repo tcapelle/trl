@@ -19,6 +19,7 @@ from collections import defaultdict
 from contextlib import nullcontext
 from typing import Any, Callable, Optional, Sized, Union
 
+import weave
 import torch
 import torch.utils.data
 import transformers
@@ -602,6 +603,7 @@ class GRPOTrainer(Trainer):
         return model
 
     # Get the per-token log probabilities for the completions for the model and the reference model
+    @weave.op
     @profiling_decorator
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
         # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
@@ -672,7 +674,8 @@ class GRPOTrainer(Trainer):
             # In evaluation, we don't reuse completions across multiple updates, so we don't need to buffer inputs.
             inputs = self._generate_and_score_completions(inputs)
         return inputs
-
+    
+    @weave.op
     def _generate_and_score_completions(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
@@ -915,8 +918,10 @@ class GRPOTrainer(Trainer):
             "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
+            "requires_grad_ref_per_token_logps": getattr(ref_per_token_logps, "requires_grad", None),
+            "requires_grad_old_per_token_logps": getattr(old_per_token_logps, "requires_grad", None),
         }
-
+    @weave.op
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
@@ -963,7 +968,7 @@ class GRPOTrainer(Trainer):
         clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
         self._metrics[mode]["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
         return loss
-
+    @weave.op
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad():
@@ -971,7 +976,7 @@ class GRPOTrainer(Trainer):
                 loss = self.compute_loss(model, inputs)
             loss = loss.mean().detach()
         return loss, None, None
-
+    @weave.op
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         mode = "eval" if self.control.should_evaluate else "train"
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
@@ -1046,3 +1051,7 @@ class GRPOTrainer(Trainer):
         )
 
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
+
+    @weave.op
+    def train(self, *args, **kwargs):
+        return super().train(*args, **kwargs)
