@@ -136,7 +136,9 @@ class ModelNew(nn.Module):
 class Args:
     benchmark_server_url: str = "https://tcapelle--kernel-benchmark-server-benchmarkservice-fastapi-app.modal.run/benchmark"
     debug: bool = False
-    model_name: str = "Qwen/Qwen2.5-Coder-3B-Instruct"  # Use a smaller Qwen model
+    model_name: str = "Qwen/Qwen2.5-Coder-14B-Instruct"  # Use a smaller Qwen model
+    dataset_name: str = "tcapelle/cuda-optimized-models"#"GPUMODE/Inductor_Created_Data_Permissive"
+    code_column: str = "pytorch_code"
 
 args = sp.parse(Args)
 
@@ -402,7 +404,7 @@ def reward_speedup(completions, ref_code=None, **kwargs):
 
 # ===== Dataset Preparation =====
 
-def get_dataset(dataset_name="cape-team/cuda-optimized-models", split="train", max_samples=100):
+def get_dataset(dataset_name=args.dataset_name, split="train", max_samples=100):
     """
     Load the preprocessed dataset and format it for training.
     
@@ -423,7 +425,7 @@ def get_dataset(dataset_name="cape-team/cuda-optimized-models", split="train", m
     
     def format_example(example):
         # Format the prompt with the preprocessed code
-        pytorch_code = example["code"]
+        pytorch_code = example[args.code_column]
         
         return {
             "prompt": [
@@ -452,11 +454,11 @@ dataset = get_dataset()
 
 # Configure training arguments
 training_args = GRPOConfig(
-    use_vllm=False,
+    use_vllm=True,
     model_init_kwargs={
         "torch_dtype": torch.bfloat16,
         "attn_implementation": "flash_attention_2",
-        "device_map": "auto",
+        # "device_map": "auto",
     },
     learning_rate=5e-6,
     adam_beta1=0.9,
@@ -470,8 +472,8 @@ training_args = GRPOConfig(
     bf16=True,
     per_device_train_batch_size=2,
     gradient_accumulation_steps=4,
-    num_generations=2,
-    max_prompt_length=1024,
+    num_generations=7,
+    max_prompt_length=1600,
     max_completion_length=2048,
     max_steps=100,
     save_steps=50,
@@ -483,8 +485,39 @@ training_args = GRPOConfig(
     reward_weights=[0.2, 0.3, 0.5],  # Weights for compilation, correctness, speedup
 )
 
+# Custom JSON serializer to handle non-serializable objects
+def serialize_for_wandb(obj):
+    """Convert training config to a wandb-compatible dict, handling non-serializable objects."""
+    if hasattr(obj, "__dict__"):
+        return {k: serialize_for_wandb(v) for k, v in obj.__dict__.items() 
+                if not k.startswith("_")}
+    elif isinstance(obj, (list, tuple)):
+        return [serialize_for_wandb(x) for x in obj]
+    elif isinstance(obj, dict):
+        return {k: serialize_for_wandb(v) for k, v in obj.items()}
+    elif hasattr(obj, "to_dict"):
+        try:
+            return serialize_for_wandb(obj.to_dict())
+        except:
+            return str(obj)
+    else:
+        # For objects that can't be serialized, convert to string
+        try:
+            return obj
+        except:
+            return str(obj)
+
 if accelerator.is_main_process:
-    wandb.init(project="grpo-cuda-optimization", config=training_args)
+    try:
+        # Use a custom serializer to handle non-serializable objects
+        wandb_config = serialize_for_wandb(training_args)
+
+        wandb.init(project="grpo-cuda-optimization", name="qwen-coder", config=wandb_config)
+    except Exception as e:
+        print(f"Failed to initialize wandb: {e}")
+        print("Continuing without wandb logging...")
+        # If wandb initialization fails, disable it in the training args
+        training_args.report_to = []
 
 # Custom callback to clear benchmark cache after each batch
 class BenchmarkCacheCallback(TrainerCallback):
