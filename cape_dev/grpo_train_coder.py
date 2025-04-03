@@ -402,105 +402,44 @@ def reward_speedup(completions, ref_code=None, **kwargs):
 
 # ===== Dataset Preparation =====
 
-
-def preprocess_sample(code):
-    """Preprocess sample to rename the custom nn.Module to 'Model'.
-    
-    This is required because the benchmark server expects the module to be called 'Model'
-    regardless of what the original name was.
+def get_dataset(dataset_name="cape-team/cuda-optimized-models", split="train", max_samples=100):
     """
-    # Extract the class that inherits from nn.Module
-    module_pattern = r'class\s+(\w+)\s*\(\s*nn\.Module\s*\)'
-    matches = re.findall(module_pattern, code)
-    
-    if not matches:
-        # No nn.Module found, return code as is
-        if args.debug and accelerator.is_main_process:
-            print("No nn.Module class found in code")
-        return code
-    
-    # Get the original class name
-    original_class_name = matches[0]
-    
-    if original_class_name == "Model":
-        # Already named Model, no need to rename
-        if args.debug and accelerator.is_main_process:
-            print("Class is already named 'Model', no renaming needed")
-        return code
-    
-    if args.debug and accelerator.is_main_process:
-        print(f"Renaming nn.Module class from '{original_class_name}' to 'Model'")
-    
-    # Replace the class name in the class definition
-    renamed_code = re.sub(
-        f'class\\s+{original_class_name}\\s*\\(\\s*nn\\.Module\\s*\\)', 
-        'class Model(nn.Module)', 
-        code
-    )
-    
-    # Replace constructor calls: OriginalClass() -> Model()
-    renamed_code = re.sub(
-        f'{original_class_name}\\s*\\(', 
-        'Model(', 
-        renamed_code
-    )
-    
-    # Replace other references to the class
-    renamed_code = re.sub(
-        f'\\b{original_class_name}\\b', 
-        'Model', 
-        renamed_code
-    )
-    
-    return renamed_code
-
-def get_dataset(dataset_name="GPUMODE/Inductor_Created_Data_Permissive", split="train", max_samples=100):
-    """
-    Load, preprocess and prepare the dataset for training.
+    Load the preprocessed dataset and format it for training.
     
     Args:
-        dataset_name: The name or path to the dataset
+        dataset_name: The name or path to the preprocessed dataset
         split: The dataset split to use ('train' or 'test')
         max_samples: Maximum number of samples to use (None for all)
     
     Returns:
         Processed dataset ready for training
     """
-    # Load the dataset
+    # Load the dataset - this is expected to be preprocessed by prepare_dataset.py
     data = load_dataset(dataset_name)[split]
     
     # Take a subset of the dataset for faster training/testing
     if max_samples and len(data) > max_samples:
         data = data.select(range(max_samples))
     
-    def process_example(example):
-        # Extract the PyTorch model code and optimized kernel code
-        pytorch_code = example["python_code"]
-        
-        # Preprocess to ensure the model is called "Model" 
-        # This preprocessing only needs to happen once, here in the dataset preparation
-        # The benchmark server expects the model to be called "Model"
-        pytorch_code = preprocess_sample(pytorch_code)
-        
-        # Truncate the code if it's too long to save memory
-        if len(pytorch_code) > 4000:
-            pytorch_code = pytorch_code[:4000] + "\n# ... truncated for memory efficiency"
+    def format_example(example):
+        # Format the prompt with the preprocessed code
+        pytorch_code = example["code"]
         
         return {
             "prompt": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": f"# CUDA Kernel Optimization Task\n\n## Your Task: Optimize This Model\n```python\n{pytorch_code}\n```\n\nImplement an optimized version called \"ModelNew\" with custom CUDA operators."}
             ],
-            "ref_code": pytorch_code  # This pytorch_code is already preprocessed to have Model as class name
+            "ref_code": pytorch_code  # Save the reference code for the reward functions
         }
     
-    # Process each example in the dataset
-    processed_data = data.map(process_example)
+    # Format each example in the dataset
+    formatted_data = data.map(format_example)
     
     if args.debug and accelerator.is_main_process:
-        print(f"Loaded {len(processed_data)} examples from {split} split")
+        print(f"Loaded and formatted {len(formatted_data)} examples from {split} split")
         
-    return processed_data
+    return formatted_data
 
 # ===== Model and Training Setup =====
 
