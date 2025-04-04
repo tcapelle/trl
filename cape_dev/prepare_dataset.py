@@ -59,6 +59,14 @@ def preprocess_sample(code, entry_point_name):
         count=1 # Only replace the class definition itself
     )
     
+    # Fix super() calls with class name to use argumentless super()
+    # Pattern: super(AnyClass, self).__init__() -> super().__init__()
+    renamed_code = re.sub(
+        r'super\s*\(\s*\w+\s*,\s*self\s*\)\s*\.\s*__init__\s*\(\s*',
+        'super().__init__(',
+        renamed_code
+    )
+    
     # Replace constructor calls: OriginalClass() -> Model()
     # Use word boundary to avoid replacing parts of other names
     renamed_code = re.sub(
@@ -67,7 +75,7 @@ def preprocess_sample(code, entry_point_name):
         renamed_code
     )
     
-    # Replace other references to the class (e.g., type hints, super calls)
+    # Replace other references to the class (e.g., type hints)
     # Use word boundary to avoid replacing parts of other names
     renamed_code = re.sub(
         f'\b{original_class_name}\b', 
