@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from transformers import AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 import wandb
+import weave
 import accelerate
 import simple_parsing as sp
 from datasets import load_dataset, Dataset
@@ -120,7 +121,7 @@ class Args:
     dataset_name: str = "tcapelle/cuda-optimized-models"#"GPUMODE/Inductor_Created_Data_Permissive"
     code_column: str = "pytorch_code"
     max_samples: int = None # debug parameter
-    
+
 args = sp.parse(Args)
 
 # Benchmark server parameters
@@ -176,7 +177,7 @@ benchmark_cache = {}
 content_cache = {}
 
 # ===== Benchmark Functions =====
-
+@weave.op
 def call_benchmark_server(
     ref_pytorch_code,
     optimized_code,
@@ -238,6 +239,7 @@ def call_benchmark_server_cached(ref_pytorch_code_hash, optimized_code_hash):
     optimized_code = content_cache.get(optimized_code_hash, "")
     return call_benchmark_server(ref_pytorch_code, optimized_code)
 
+@weave.op
 def score_kernel(output, ref_code):
     """Score the generated kernel based on benchmark results"""
     # Ensure inputs are strings
@@ -300,7 +302,6 @@ def clear_benchmark_cache():
     benchmark_cache.clear()
 
 # ===== Reward Functions =====
-
 def reward_compilation(completions, ref_code=None, **kwargs):
     """Reward function based on whether the generated code compiles"""
     responses = [completion[0]['content'] for completion in completions]
@@ -440,7 +441,7 @@ training_args = GRPOConfig(
     logging_steps=1,
     bf16=True,
     per_device_train_batch_size=2,
-    gradient_accumulation_steps=4,
+    gradient_accumulation_steps=8,
     num_generations=7,
     max_prompt_length=1024,
     max_completion_length=1024,
@@ -481,7 +482,7 @@ if accelerator.is_main_process:
     try:
         # Use a custom serializer to handle non-serializable objects
         wandb_config = serialize_for_wandb(training_args)
-
+        weave.init("grpo-cuda-optimization")
         wandb.init(project="grpo-cuda-optimization", name="qwen-coder", config=wandb_config)
     except Exception as e:
         print(f"Failed to initialize wandb: {e}")
