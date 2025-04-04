@@ -1,3 +1,14 @@
+"""
+Loads the GPUMODE/Inductor_Created_Data_Permissive dataset, performs preprocessing, 
+and prepares it for use in training CUDA optimization models.
+
+Preprocessing steps include:
+1. Renaming the main nn.Module class (identified by the 'entry_point' column) to 'Model'.
+2. Standardizing the 'get_init_inputs' function to return only positional arguments.
+3. Truncating code exceeding a specific length.
+
+The processed dataset is then optionally pushed to the Hugging Face Hub.
+"""
 import re
 from datasets import load_dataset
 from dataclasses import dataclass
@@ -8,31 +19,28 @@ class Args:
     dataset_name: str = "GPUMODE/Inductor_Created_Data_Permissive"
     split: str = "train"
     max_samples: int = None  # Set to None to use all samples
-    output_dataset_name: str = "your-username/cuda-optimized-models"  # Change this to your HF username
+    output_dataset_name: str = "tcapelle/cuda-optimized-models"  # Change this to your HF username
     debug: bool = False
     push_to_hub: bool = True
+    max_code_length: int = 4000 # Max length for code snippets before truncation
 
 args = sp.parse(Args)
 
-def preprocess_sample(code):
+def preprocess_sample(code, entry_point_name):
     """Preprocess sample to rename the custom nn.Module to 'Model'.
     
     This is required because the benchmark server expects the module to be called 'Model'
     regardless of what the original name was.
     """
-    # Extract the class that inherits from nn.Module
-    module_pattern = r'class\s+(\w+)\s*\(\s*nn\.Module\s*\)'
-    matches = re.findall(module_pattern, code)
+    original_class_name = entry_point_name
     
-    if not matches:
-        # No nn.Module found, return code as is
+    # Check if the entry point is actually a class definition before proceeding
+    # Simple check: look for "class OriginalClassName(" in the code
+    if f"class {original_class_name}(" not in code:
         if args.debug:
-            print("No nn.Module class found in code")
+            print(f"Entry point '{original_class_name}' not found as a class definition in code. Skipping renaming.")
         return code
-    
-    # Get the original class name
-    original_class_name = matches[0]
-    
+
     if original_class_name == "Model":
         # Already named Model, no need to rename
         if args.debug:
@@ -43,22 +51,26 @@ def preprocess_sample(code):
         print(f"Renaming nn.Module class from '{original_class_name}' to 'Model'")
     
     # Replace the class name in the class definition
+    # Use a more specific regex to avoid accidental replacements
     renamed_code = re.sub(
-        f'class\\s+{original_class_name}\\s*\\(\\s*nn\\.Module\\s*\\)', 
-        'class Model(nn.Module)', 
-        code
+        f'class\s+{original_class_name}\s*\(', 
+        'class Model(', 
+        code,
+        count=1 # Only replace the class definition itself
     )
     
     # Replace constructor calls: OriginalClass() -> Model()
+    # Use word boundary to avoid replacing parts of other names
     renamed_code = re.sub(
-        f'{original_class_name}\\s*\\(', 
+        f'\b{original_class_name}\s*\(', 
         'Model(', 
         renamed_code
     )
     
-    # Replace other references to the class
+    # Replace other references to the class (e.g., type hints, super calls)
+    # Use word boundary to avoid replacing parts of other names
     renamed_code = re.sub(
-        f'\\b{original_class_name}\\b', 
+        f'\b{original_class_name}\b', 
         'Model', 
         renamed_code
     )
@@ -124,7 +136,17 @@ def standardize_get_init_inputs(code):
     
     if kwargs_match:
         # Extract the kwargs content
-        kwargs_content = kwargs_match.group(1)
+        kwargs_content = kwargs_match.group(1).strip()
+        
+        # If the dictionary is empty, return an empty list
+        if not kwargs_content:
+            new_return = "return []"
+            lines[return_line_idx] = re.sub(r'return\s*.*', new_return, return_line)
+            
+            if args.debug:
+                print(f"Empty dictionary found, returning empty list:\nOriginal: {return_line.strip()}\nNew: {lines[return_line_idx].strip()}")
+            
+            return '\n'.join(lines)
         
         # Find all the values from key-value pairs
         values = []
@@ -137,8 +159,8 @@ def standardize_get_init_inputs(code):
         if values:
             new_return = f"return [{', '.join(values)}]"
         else:
-            # Default value if no values found
-            new_return = "return [4]"
+            # Return empty list if no values found
+            new_return = "return []"
         
         # Replace the return line
         lines[return_line_idx] = re.sub(r'return\s*.*', new_return, return_line)
@@ -149,15 +171,11 @@ def standardize_get_init_inputs(code):
         # Join the lines back together
         return '\n'.join(lines)
     else:
-        # Use default value if we couldn't find the expected pattern
-        new_return = "return [4]"
-        lines[return_line_idx] = re.sub(r'return\s*.*', new_return, return_line)
-        
+        # Keep the original return statement if we don't match the expected pattern
         if args.debug:
-            print(f"Using default value for get_init_inputs:\nOriginal: {return_line.strip()}\nNew: {lines[return_line_idx].strip()}")
+            print(f"Using original return for get_init_inputs: {return_line.strip()}")
         
-        # Join the lines back together
-        return '\n'.join(lines)
+        return code
     
     return code
 
@@ -191,16 +209,17 @@ def prepare_dataset():
     def process_example(example):
         # Extract the PyTorch model code
         pytorch_code = example["python_code"]
+        entry_point = example["entry_point"]
         
         # Preprocess to ensure the model is called "Model" 
-        pytorch_code = preprocess_sample(pytorch_code)
+        pytorch_code = preprocess_sample(pytorch_code, entry_point)
         
         # Standardize get_init_inputs function
         pytorch_code = standardize_get_init_inputs(pytorch_code)
         
         # Truncate the code if it's too long to save memory
-        if len(pytorch_code) > 4000:
-            pytorch_code = pytorch_code[:4000] + "\n# ... truncated for memory efficiency"
+        if args.max_code_length is not None and len(pytorch_code) > args.max_code_length:
+            pytorch_code = pytorch_code[:args.max_code_length] + f"\n# ... truncated (>{args.max_code_length} chars) for memory efficiency"
         
         # Return only the preprocessed code, without formatting the prompt
         # Prompt formatting will be handled by the training script
@@ -241,7 +260,8 @@ def main():
     print(f"Preprocessing steps applied:")
     print(f"  - Renamed nn.Module classes to 'Model'")
     print(f"  - Standardized get_init_inputs functions to return positional args")
-    print(f"  - Truncated code longer than 4000 characters")
+    if args.max_code_length is not None:
+        print(f"  - Truncated code longer than {args.max_code_length} characters")
     
     if args.push_to_hub:
         print(f"\nDataset is now available at: https://huggingface.co/datasets/{args.output_dataset_name}")
