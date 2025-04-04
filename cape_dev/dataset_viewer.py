@@ -5,7 +5,7 @@ from datasets import load_dataset
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-
+import random
 
 @dataclass
 class Args:
@@ -29,6 +29,16 @@ class Args:
     columns: Optional[List[str]] = field(
         default=None,
         metadata={"help": "Specific columns to display (displays all if None)"}
+    )
+    
+    full: bool = field(
+        default=False,
+        metadata={"help": "Display full content of cells without truncation"}
+    )
+    
+    random: bool = field(
+        default=False,
+        metadata={"help": "Display random rows"}
     )
 
 
@@ -67,15 +77,24 @@ def main():
         
         # Add rows to the table
         num_samples = min(args.num_rows, len(dataset))
-        for i in range(num_samples):
+        if args.random:
+            num_samples = min(args.num_rows, len(dataset))
+            indices = random.sample(range(len(dataset)), num_samples)
+        else:
+            indices = range(num_samples)
+        for i in indices:
             row_values = []
             for col in columns_to_show:
                 value = dataset[i][col]
                 # Handle different data types appropriately
                 if isinstance(value, (list, dict)):
-                    display_value = str(value)[:100] + "..." if len(str(value)) > 100 else str(value)
+                    display_value = str(value)
+                    if not args.full and len(display_value) > 100:
+                        display_value = display_value[:100] + "..."
                 elif isinstance(value, str):
-                    display_value = value[:100] + "..." if len(value) > 100 else value
+                    display_value = value
+                    if not args.full and len(display_value) > 100:
+                        display_value = display_value[:100] + "..."
                 else:
                     display_value = str(value)
                 row_values.append(display_value)
