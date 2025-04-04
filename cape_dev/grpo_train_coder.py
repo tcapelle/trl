@@ -16,6 +16,7 @@ import hashlib
 
 SYSTEM_PROMPT = """
 # CUDA Kernel Optimization Task
+You are an expert in PyTorch and CUDA programming. 
 
 ## Objective
 Your task is to optimize PyTorch models by replacing standard PyTorch operators with custom CUDA kernels. You should:
@@ -23,26 +24,7 @@ Your task is to optimize PyTorch models by replacing standard PyTorch operators 
 - Consider operator fusion opportunities (e.g., combining matmul+relu)
 - Explore algorithmic optimizations (e.g., online softmax)
 - Rename your optimized implementation as "ModelNew"
-
-## Key GPU Programming Concepts
-- Thread: A thread is a single execution unit that can run a single instruction at a time.
-- Thread Block: A thread block is a group of threads that can cooperate with each other.
-- Warp: A warp is a group of threads that are scheduled together and execute in parallel.
-- Shared Memory: Shared memory is a memory space that can be accessed by all threads in a thread block.
-- Register: A register is a small memory space that can be accessed by a single thread.
-- Memory Hierarchy: Memory hierarchy is a pyramid of memory types with different speeds and sizes.
-- Memory Bandwidth: Memory bandwidth is the rate at which data can be read from or stored into memory.
-- Cache: Cache is a small memory space that stores frequently accessed data.
-- HBM: HBM is a high-bandwidth memory technology that uses 3D-stacked DRAM.
-
-## Best Practices
-- Find ways to parallelize sequential code.
-- Minimize data transfers between the host and the device.
-- Adjust kernel launch configuration to maximize device utilization.
-- Ensure that global memory accesses are coalesced.
-- Minimize redundant accesses to global memory whenever possible.
-- Avoid long sequences of diverged execution by threads within the same warp.
-- Use specialized instructions based on the specific GPU architecture
+- Reply with a short explanation and the optimized code, nothing else
 
 ## Example: Original Model
 ```python
@@ -60,14 +42,12 @@ class Model(nn.Module):
 
 
 def get_inputs():
-    # randomly generate input tensors based on the model architecture
     a = torch.randn(1, 128).cuda()
     b = torch.randn(1, 128).cuda()
     return [a, b]
 
 
 def get_init_inputs():
-    # randomly generate tensors required for initialization based on the model architecture
     return []
 
 ```
@@ -139,7 +119,8 @@ class Args:
     model_name: str = "Qwen/Qwen2.5-Coder-14B-Instruct"  # Use a smaller Qwen model
     dataset_name: str = "tcapelle/cuda-optimized-models"#"GPUMODE/Inductor_Created_Data_Permissive"
     code_column: str = "pytorch_code"
-
+    max_samples: int = None # debug parameter
+    
 args = sp.parse(Args)
 
 # Benchmark server parameters
@@ -404,18 +385,7 @@ def reward_speedup(completions, ref_code=None, **kwargs):
 
 # ===== Dataset Preparation =====
 
-def get_dataset(dataset_name=args.dataset_name, split="train", max_samples=100):
-    """
-    Load the preprocessed dataset and format it for training.
-    
-    Args:
-        dataset_name: The name or path to the preprocessed dataset
-        split: The dataset split to use ('train' or 'test')
-        max_samples: Maximum number of samples to use (None for all)
-    
-    Returns:
-        Processed dataset ready for training
-    """
+def get_dataset(dataset_name=args.dataset_name, split="train", max_samples=args.max_samples):
     # Load the dataset - this is expected to be preprocessed by prepare_dataset.py
     data = load_dataset(dataset_name)[split]
     
@@ -430,7 +400,7 @@ def get_dataset(dataset_name=args.dataset_name, split="train", max_samples=100):
         return {
             "prompt": [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"# CUDA Kernel Optimization Task\n\n## Your Task: Optimize This Model\n```python\n{pytorch_code}\n```\n\nImplement an optimized version called \"ModelNew\" with custom CUDA operators."}
+                {"role": "user", "content": f"Here is the code to optimize:\n```python\n{pytorch_code}\n```\n\nImplement an optimized version called \"ModelNew\" with custom CUDA operators."}
             ],
             "ref_code": pytorch_code  # Save the reference code for the reward functions
         }
@@ -446,8 +416,7 @@ def get_dataset(dataset_name=args.dataset_name, split="train", max_samples=100):
 # ===== Model and Training Setup =====
 
 # Load the model and tokenizer
-model = args.model_name
-tokenizer = AutoTokenizer.from_pretrained(model)
+tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
 # Prepare the dataset
 dataset = get_dataset()
@@ -465,7 +434,7 @@ training_args = GRPOConfig(
     adam_beta2=0.99,
     weight_decay=0.1,
     warmup_ratio=0.1,
-    beta=0.1,
+    beta=0,
     lr_scheduler_type="cosine",
     optim="adamw_torch",
     logging_steps=1,
@@ -473,9 +442,10 @@ training_args = GRPOConfig(
     per_device_train_batch_size=2,
     gradient_accumulation_steps=4,
     num_generations=7,
-    max_prompt_length=1600,
-    max_completion_length=2048,
-    max_steps=100,
+    max_prompt_length=1024,
+    max_completion_length=1024,
+    # max_steps=100,
+    num_train_epochs=1,
     save_steps=50,
     max_grad_norm=0.1,
     log_completions=True,
@@ -530,7 +500,7 @@ class BenchmarkCacheCallback(TrainerCallback):
 
 # Initialize the trainer
 trainer = GRPOTrainer(
-    model=model,
+    model=args.model_name,
     processing_class=tokenizer,
     reward_funcs=[reward_compilation, reward_correctness, reward_speedup],
     args=training_args,
