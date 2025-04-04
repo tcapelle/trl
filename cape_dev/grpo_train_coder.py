@@ -1,3 +1,4 @@
+import asyncio
 import torch
 import requests
 from io import BytesIO
@@ -11,8 +12,15 @@ import accelerate
 import simple_parsing as sp
 from datasets import load_dataset
 from functools import lru_cache
+import random
+import litellm
+from pydantic import BaseModel, Field
 
 from utils import ensure_string, hash_content, serialize_for_wandb, extract_python_code
+
+# Set litellm logging
+litellm.set_verbose = False
+
 
 # ===== Configuration =====
 
@@ -113,6 +121,155 @@ class ModelNew(nn.Module):
 ```
 """
 
+# LLM evaluation prompt for soft-scoring
+LLM_EVAL_SYSTEM_PROMPT = """
+You are an expert in CUDA kernel optimization and GPU programming. Your task is to evaluate a given CUDA kernel implementation compared to a reference PyTorch implementation without running the code. Focus your evaluation on:
+
+## 1. Correctness:
+- Will the CUDA kernel produce exactly the same outputs as the reference PyTorch implementation?
+- Identify any logical errors, indexing issues, off-by-one errors, or data race conditions.
+
+## 2. Code Quality:
+- Is the CUDA kernel code clean, readable, maintainable, and well-documented?
+- Does the code follow GPU programming best practices (e.g., avoiding divergence, coalesced memory accesses, efficient shared memory use)?
+- Is the kernel launch configuration (block/grid sizes) appropriate for good GPU utilization?
+- Are there optimization opportunities missed (e.g., operator fusion, reduced memory traffic, improved memory hierarchy usage)?
+
+## Task Context:
+You are optimizing PyTorch models by replacing standard operators with custom CUDA kernels. The optimization goals include:
+- Operator replacement with efficient CUDA implementations.
+- Operator fusion opportunities (e.g., combining operations such as matmul + activation).
+- Algorithmic optimizations (e.g., online softmax computation).
+- Renaming the optimized implementation to "ModelNew".
+
+## Key GPU Programming Concepts:
+- **Thread**: A single execution unit executing one instruction at a time.
+- **Thread Block**: A group of threads cooperating via shared memory.
+- **Warp**: Group of threads executing concurrently, sharing the instruction stream.
+- **Shared Memory**: Fast memory accessible by threads in the same block.
+- **Registers**: Fastest memory private to individual threads.
+- **Memory Hierarchy**: Arrangement of memory types (register, shared, global memory) with varying speeds and capacities.
+- **Memory Bandwidth**: Rate of data transfer to/from GPU memory.
+- **Memory Coalescing**: Optimizing memory accesses by aligning them across threads.
+- **Cache and HBM**: Caches store frequently used data; High-Bandwidth Memory (HBM) offers rapid data access to the GPU.
+
+## CUDA Kernel Best Practices Checklist:
+- Parallelize sequential operations effectively.
+- Minimize data transfers between host and device.
+- Optimize kernel launch parameters (blocks/grid size) for GPU architecture.
+- Ensure coalesced global memory accesses.
+- Reduce redundant global memory accesses.
+- Avoid warp divergence.
+- Leverage specialized GPU instructions (e.g., tensor cores) when beneficial.
+
+
+## Example:
+
+### Reference PyTorch Implementation:
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.randn(1, 128).cuda()
+    b = torch.randn(1, 128).cuda()
+    return [a, b]
+
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+```
+
+### Generated CUDA kernel:
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for element-wise addition
+elementwise_add_source = \"\"\"
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void elementwise_add_kernel(const float* a, const float* b, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    elementwise_add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+\"\"\"
+
+elementwise_add_cpp_source = (
+    "torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for element-wise addition
+elementwise_add = load_inline(
+    name="elementwise_add",
+    cpp_sources=elementwise_add_cpp_source,
+    cuda_sources=elementwise_add_source,
+    functions=["elementwise_add_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.elementwise_add = elementwise_add
+
+    def forward(self, a, b):
+        return self.elementwise_add.elementwise_add_cuda(a, b)
+
+```
+
+### Response
+
+- "analysis": "Kernel correctly implements element-wise addition. Quality is good, but improved error handling and documentation are recommended."
+- "correctness": 0.9
+- "code_quality": 0.8
+
+## Format:
+Reply in JSON format with the following fields:
+- "analysis": "Detailed analysis of the generated CUDA kernel."
+- "correctness": "Correctness score from 0.0 to 1.0, where 1.0 is perfectly correct"
+- "code_quality": "Code quality score from 0.0 to 1.0, where 1.0 is excellent quality"
+
+"""
+
+class LLMKernelEvaluation(BaseModel):
+    """The LLM evaluation response for the Cuda Kernel"""
+    analysis: str = Field(description="Detailed analysis of the generated CUDA kernel.")
+    correctness: float = Field(description="Correctness score from 0.0 to 1.0, where 1.0 is perfectly correct")
+    code_quality: float = Field(description="Code quality score from 0.0 to 1.0, where 1.0 is excellent quality")
+
 
 @dataclass
 class Args:
@@ -122,6 +279,9 @@ class Args:
     dataset_name: str = "tcapelle/cuda-optimized-models"#"GPUMODE/Inductor_Created_Data_Permissive"
     code_column: str = "pytorch_code"
     max_samples: int = None # debug parameter
+    hard_score_percentage: float = 0.1  # Percentage of samples to use hard scoring (benchmark server)
+    llm_evaluator_model: str = "gpt-4o"  # Model to use for soft scoring
+    llm_reward_weight: float = 0.0  # Weight for the LLM-based reward relative to benchmark rewards
 
 args = sp.parse(Args)
 
@@ -214,6 +374,60 @@ def call_benchmark_server(
     except Exception as e:
         return {"error": f"Exception calling benchmark server: {str(e)}"}
 
+# LLM-based evaluation function
+@weave.op
+async def evaluate_with_llm(extracted_code, ref_code, model=args.llm_evaluator_model):
+    """Use an LLM to evaluate the quality of the optimized code"""
+    # Ensure inputs are strings
+    ref_code = ensure_string(ref_code)
+    extracted_code = ensure_string(extracted_code)
+    
+    # Prepare the prompt
+    prompt = f"""Analyse the following code and provide your evaluation in JSON format.
+
+    ## Reference PyTorch Implementation:
+    ```python
+    {ref_code}
+    ```
+
+    ## Generated CUDA kernel:
+    ```python
+    {extracted_code}
+    """
+
+    try:
+        # Call the LLM with structured output format
+        response = await litellm.acompletion(
+            model=model,
+            messages=[
+                {"role": "system", "content": LLM_EVAL_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt}
+                ],
+            response_format=LLMKernelEvaluation,
+            temperature=0.0,
+        )
+        
+        # Parse the response using Pydantic
+        content = response.choices[0].message.content
+        evaluation = LLMKernelEvaluation.model_validate_json(content)
+        
+        # Convert to result format
+        result = {
+            "analysis": evaluation.analysis,
+            "correctness": evaluation.correctness,
+            "code_quality": evaluation.code_quality,
+        }
+        
+        return result
+    except Exception as e:
+        if accelerator.is_main_process and args.debug:
+            print(f"Error in LLM evaluation: {e}")
+        return {
+            "analysis": f"Error in evaluation: {str(e)}",
+            "correctness": None,
+            "code_quality": None,
+        }
+
 # Use LRU cache with a high maxsize to store results during training
 @lru_cache(maxsize=10000)
 def call_benchmark_server_cached(ref_pytorch_code_hash, optimized_code_hash):
@@ -239,28 +453,42 @@ def score_kernel(extracted_code, ref_code):
     content_cache[ref_hash] = ref_code
     content_cache[code_hash] = extracted_code
     
-    # Use the cached version of benchmark server call to avoid duplicate calls
-    benchmark_result = call_benchmark_server_cached(ref_hash, code_hash)
+    # Decide whether to use hard scoring (benchmark) based on percentage
+    use_hard_scoring = random.random() < args.hard_score_percentage
     
-    error = benchmark_result.get("error", None)
-    if error is not None:
-        return {
-            "compiled": False,
-            "correctness": False,
-            "speedup_vs_compile": 0,
-            "speedup_vs_eager": 0,
-            "error": benchmark_result.get("content", str(error)),
-        }
-
-    # Handle missing keys safely with .get() and provide defaults
-    kernel_result = benchmark_result.get("kernel_result", {})
-    return {
-        "compiled": kernel_result.get("compiled", False),
-        "correctness": kernel_result.get("correctness", False),
-        "speedup_vs_compile": benchmark_result.get("speedup_vs_compile", 0),
-        "speedup_vs_eager": benchmark_result.get("speedup_vs_eager", 0),
-        "error": benchmark_result.get("error", None),
+    # Initialize result with None values
+    result = {
+        "compiled": False,
+        "correctness": False,
+        "speedup_vs_compile": 0,
+        "speedup_vs_eager": 0,
+        "error": None,
+        "is_hard_score": False
     }
+    
+    if use_hard_scoring:
+        # Use the cached version of benchmark server call
+        benchmark_result = call_benchmark_server_cached(ref_hash, code_hash)
+        
+        error = benchmark_result.get("error", None)
+        if error is not None:
+            result.update({
+                "error": benchmark_result.get("content", str(error)),
+                "is_hard_score": True
+            })
+        else:
+            # Handle missing keys safely with .get() and provide defaults
+            kernel_result = benchmark_result.get("kernel_result", {})
+            result.update({
+                "compiled": kernel_result.get("compiled", False),
+                "correctness": kernel_result.get("correctness", False),
+                "speedup_vs_compile": benchmark_result.get("speedup_vs_compile", 0),
+                "speedup_vs_eager": benchmark_result.get("speedup_vs_eager", 0),
+                "error": benchmark_result.get("error", None),
+                "is_hard_score": True
+            })
+    
+    return result
 
 def get_cached_score(response, ref_code):
     """Get or compute kernel score, using a cache to avoid duplicate benchmark calls"""
@@ -283,8 +511,8 @@ def get_cached_score(response, ref_code):
     benchmark_cache[cache_key] = result
     return result
 
-def clear_benchmark_cache():
-    """Clear the benchmark cache between batches to avoid memory leaks"""
+def clear_caches():
+    """Clear benchmark cache between batches to avoid memory leaks"""
     # Clear the benchmark results cache
     benchmark_cache.clear()
     
@@ -292,6 +520,24 @@ def clear_benchmark_cache():
     # cached across batches, but we monitor its size in the callback
     if accelerator.is_main_process and args.debug and len(content_cache) > 0:
         print(f"Content cache size: {len(content_cache)} entries")
+        
+# Custom callback to clear caches after each batch
+class CacheCallback(TrainerCallback):
+    def __init__(self, content_cache_max_size=5000):
+        self.content_cache_max_size = content_cache_max_size
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        # Ensure we clear benchmark cache after each step
+        clear_caches()
+        
+        # Only clear content cache if it grows too large
+        if len(content_cache) > self.content_cache_max_size:
+            if accelerator.is_main_process and args.debug:
+                print(f"Clearing content cache (size: {len(content_cache)})")
+            content_cache.clear()
+            
+            # Also clear the LRU cache for call_benchmark_server_cached
+            call_benchmark_server_cached.cache_clear()
 
 # ===== Reward Functions =====
 def reward_compilation(completions, ref_code=None, **kwargs):
@@ -308,14 +554,18 @@ def reward_compilation(completions, ref_code=None, **kwargs):
     rewards = []
     for response, ref in zip(responses, ref_codes):
         try:
-            # Use get_cached_score which now handles the extraction internally
+            # Use get_cached_score which handles the extraction internally
             result = get_cached_score(response, ref)
-            # Binary reward: 1.0 if compiled, -1.0 if not
-            rewards.append(1.0 if result["compiled"] else -1.0)
+            
+            # Only use rewards from hard scoring, otherwise return None
+            if result.get("is_hard_score", False):
+                rewards.append(1.0 if result["compiled"] else -1.0)
+            else:
+                rewards.append(None)  # Skip this reward for samples without hard scoring
         except Exception as e:
             if accelerator.is_main_process and args.debug:
                 print(f"Error in reward_compilation: {e}")
-            rewards.append(-1.0)  # Assign negative reward on error
+            rewards.append(None)  # Return None on error instead of negative reward
     
     return rewards
 
@@ -333,14 +583,18 @@ def reward_correctness(completions, ref_code=None, **kwargs):
     rewards = []
     for response, ref in zip(responses, ref_codes):
         try:
-            # Use get_cached_score which now handles the extraction internally
+            # Use get_cached_score which handles the extraction internally
             result = get_cached_score(response, ref)
-            # Binary reward: 1.0 if correct, -1.0 if not
-            rewards.append(1.0 if result["correctness"] else -1.0)
+            
+            # Only use rewards from hard scoring, otherwise return None
+            if result.get("is_hard_score", False):
+                rewards.append(1.0 if result["correctness"] else -1.0)
+            else:
+                rewards.append(None)  # Skip this reward for samples without hard scoring
         except Exception as e:
             if accelerator.is_main_process and args.debug:
                 print(f"Error in reward_correctness: {e}")
-            rewards.append(-1.0)  # Assign negative reward on error
+            rewards.append(None)  # Return None on error instead of negative reward
     
     return rewards
 
@@ -358,25 +612,63 @@ def reward_speedup(completions, ref_code=None, **kwargs):
     rewards = []
     for response, ref in zip(responses, ref_codes):
         try:
-            # Use get_cached_score which now handles the extraction internally
+            # Use get_cached_score which handles the extraction internally
             result = get_cached_score(response, ref)
-            # Reward based on speedup vs eager execution
-            # Scale between -1.0 and 10.0 based on performance
-            speedup = result["speedup_vs_eager"]
-            if speedup <= 0:
-                reward = -1.0
+            
+            # Only use rewards from hard scoring, otherwise return None
+            if result.get("is_hard_score", False):
+                speedup = result["speedup_vs_eager"]
+                if speedup <= 0:
+                    reward = -1.0
+                else:
+                    # Cap the reward at 10.0 for very high speedups
+                    reward = min(10.0, speedup)
+                rewards.append(reward)
             else:
-                # Cap the reward at 10.0 for very high speedups
-                reward = min(10.0, speedup)
-            rewards.append(reward)
+                rewards.append(None)  # Skip this reward for samples without hard scoring
         except Exception as e:
             if accelerator.is_main_process and args.debug:
                 print(f"Error in reward_speedup: {e}")
-            rewards.append(-1.0)  # Assign negative reward on error
+            rewards.append(None)  # Return None on error instead of negative reward
     
-    # After computing all rewards for this batch, clear the cache to free memory
-    clear_benchmark_cache()
+    return rewards
+
+def reward_llm_scoring(completions, ref_code, **kwargs):
+    """LLM-based reward function that evaluates code quality and correctness"""
+    responses = [completion[0]['content'] for completion in completions]
     
+    # Extract ref_code from kwargs if needed
+    ref_codes = []
+    if ref_code is None and 'ref_code' in kwargs:
+        ref_codes = kwargs['ref_code']
+    else:
+        ref_codes = [ref_code] * len(responses)
+
+    @weave.op
+    async def get_llm_eval(response, ref):
+        try:
+            # Use get_cached_llm_eval which handles the extraction internally
+            
+            result = await evaluate_with_llm(response, ref)
+            # Compute a combined score based on correctness and code quality
+            correctness_score = result["correctness"]  
+            quality_score = result["code_quality"]
+            
+            # Combined reward with more weight on correctness
+            reward = correctness_score + quality_score
+            
+            return reward
+        except Exception as e:
+            if accelerator.is_main_process and args.debug:
+                print(f"Error in reward_llm_scoring: {e}")
+            return None  # Return None on error instead of negative reward
+
+    # Get an event loop to run the coroutine
+    loop = asyncio.get_event_loop()
+    # Run the coroutine and get the results
+    tasks = [get_llm_eval(response, ref) for response, ref in zip(responses, ref_codes)]
+    rewards = loop.run_until_complete(asyncio.gather(*tasks))
+
     return rewards
 
 # ===== Dataset Preparation =====
@@ -447,8 +739,7 @@ training_args = GRPOConfig(
     log_completions=True,
     report_to="wandb",
     output_dir="grpo_cuda_output",
-    # Set reward weights to give more importance to speedup
-    reward_weights=[0.2, 0.3, 0.5],  # Weights for compilation, correctness, speedup
+    reward_weights=[0.2, 0.3, 0.5, args.llm_reward_weight],  # Weights for compilation, correctness, speedup, llm_scoring
 )
 
 if accelerator.is_main_process:
@@ -463,32 +754,14 @@ if accelerator.is_main_process:
         # If wandb initialization fails, disable it in the training args
         training_args.report_to = []
 
-# Custom callback to clear benchmark cache after each batch
-class BenchmarkCacheCallback(TrainerCallback):
-    def __init__(self, content_cache_max_size=5000):
-        self.content_cache_max_size = content_cache_max_size
-    
-    def on_step_end(self, args, state, control, **kwargs):
-        # Ensure we clear the benchmark cache after each step
-        clear_benchmark_cache()
-        
-        # Only clear content cache if it grows too large
-        if len(content_cache) > self.content_cache_max_size:
-            if accelerator.is_main_process and args.debug:
-                print(f"Clearing content cache (size: {len(content_cache)})")
-            content_cache.clear()
-            
-            # Also clear the LRU cache for call_benchmark_server_cached
-            call_benchmark_server_cached.cache_clear()
-
 # Initialize the trainer
 trainer = GRPOTrainer(
     model=args.model_name,
     processing_class=tokenizer,
-    reward_funcs=[reward_compilation, reward_correctness, reward_speedup],
+    reward_funcs=[reward_compilation, reward_correctness, reward_speedup, reward_llm_scoring],
     args=training_args,
     train_dataset=dataset,
-    callbacks=[BenchmarkCacheCallback()],
+    callbacks=[CacheCallback()],
 )
 
 # Start training
