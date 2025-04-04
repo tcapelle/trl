@@ -9,9 +9,10 @@ import wandb
 import weave
 import accelerate
 import simple_parsing as sp
-from datasets import load_dataset, Dataset
+from datasets import load_dataset
 from functools import lru_cache
-import hashlib
+
+from utils import ensure_string, hash_content, serialize_for_wandb, extract_python_code
 
 # ===== Configuration =====
 
@@ -133,41 +134,24 @@ BENCHMARK_SERVER_PARAMS = {
 
 accelerator = accelerate.Accelerator()
 
-# ===== Utility Functions =====
 
-def extract_python_code(text):
-    """Extract Python code from markdown code blocks or text"""
-    # Look for Python code blocks
-    python_blocks = re.findall(r'```(?:python|py)?\s*([\s\S]*?)```', text)
-    if python_blocks:
-        return python_blocks[0].strip()
-        
-    # If no Python blocks, extract anything that looks like Python code
-    code_lines = []
-    in_code = False
-    for line in text.split('\n'):
-        if line.strip().startswith('```'):
-            in_code = not in_code
-            continue
-        if in_code:
-            code_lines.append(line)
-    
-    return '\n'.join(code_lines) if code_lines else text
 
-# Helper function to ensure content is a string
-def ensure_string(content):
-    """Convert content to string if it's not already"""
-    if isinstance(content, list):
-        return ensure_string(content[0])
-    elif not isinstance(content, str):
-        return str(content)
-    return content
+# ===== Caching Strategy =====
+# The caching mechanism uses two levels:
+# 1. content_cache: A dictionary that maps content hashes to the actual content
+#    - Keys: MD5 hashes of the content (ref code or optimized code)
+#    - Values: The actual content as strings
+#
+# 2. benchmark_cache: A dictionary that maps (extracted_code_hash, ref_code_hash) tuples to benchmark results
+#    - This avoids redundant benchmark server calls for the same code
+#
+# 3. call_benchmark_server_cached: An LRU-cached function that uses content hashes to retrieve 
+#    the actual content from content_cache and make the benchmark server call
+#
+# This approach ensures we don't duplicate benchmark calls, which are expensive,
+# while also keeping memory usage reasonable by storing just one copy of each content.
 
-# Helper function to create a hash of content for caching
-def hash_content(content):
-    """Create a hash of content for use as a cache key"""
-    content_str = ensure_string(content)
-    return hashlib.md5(content_str.encode()).hexdigest()
+
 
 # Create a cache for benchmark results to avoid duplicate calls
 # Using strings as keys instead of tuples with lists
@@ -237,16 +221,15 @@ def call_benchmark_server_cached(ref_pytorch_code_hash, optimized_code_hash):
     # Look up the actual content from the content cache
     ref_pytorch_code = content_cache.get(ref_pytorch_code_hash, "")
     optimized_code = content_cache.get(optimized_code_hash, "")
+
     return call_benchmark_server(ref_pytorch_code, optimized_code)
 
 @weave.op
-def score_kernel(output, ref_code):
+def score_kernel(extracted_code, ref_code):
     """Score the generated kernel based on benchmark results"""
     # Ensure inputs are strings
-    output = ensure_string(output)
+    extracted_code = ensure_string(extracted_code)
     ref_code = ensure_string(ref_code)
-    
-    extracted_code = extract_python_code(output)
     
     # Create hashes for the content
     ref_hash = hash_content(ref_code)
@@ -285,21 +268,30 @@ def get_cached_score(response, ref_code):
     response = ensure_string(response)
     ref_code = ensure_string(ref_code)
     
-    # Create a cache key based on the response and reference code - using hashes to ensure hashability
-    cache_key = (hash_content(response), hash_content(ref_code))
+    # Extract Python code from the response
+    extracted_code = extract_python_code(response)
+    
+    # Create a cache key based on the extracted code and reference code
+    cache_key = (hash_content(extracted_code), hash_content(ref_code))
     
     # Check if we've already computed this result
     if cache_key in benchmark_cache:
         return benchmark_cache[cache_key]
     
     # If not, compute the result and store it
-    result = score_kernel(response, ref_code)
+    result = score_kernel(extracted_code, ref_code)
     benchmark_cache[cache_key] = result
     return result
 
 def clear_benchmark_cache():
     """Clear the benchmark cache between batches to avoid memory leaks"""
+    # Clear the benchmark results cache
     benchmark_cache.clear()
+    
+    # We don't clear content_cache here as it's more efficient to keep content 
+    # cached across batches, but we monitor its size in the callback
+    if accelerator.is_main_process and args.debug and len(content_cache) > 0:
+        print(f"Content cache size: {len(content_cache)} entries")
 
 # ===== Reward Functions =====
 def reward_compilation(completions, ref_code=None, **kwargs):
@@ -316,6 +308,7 @@ def reward_compilation(completions, ref_code=None, **kwargs):
     rewards = []
     for response, ref in zip(responses, ref_codes):
         try:
+            # Use get_cached_score which now handles the extraction internally
             result = get_cached_score(response, ref)
             # Binary reward: 1.0 if compiled, -1.0 if not
             rewards.append(1.0 if result["compiled"] else -1.0)
@@ -340,6 +333,7 @@ def reward_correctness(completions, ref_code=None, **kwargs):
     rewards = []
     for response, ref in zip(responses, ref_codes):
         try:
+            # Use get_cached_score which now handles the extraction internally
             result = get_cached_score(response, ref)
             # Binary reward: 1.0 if correct, -1.0 if not
             rewards.append(1.0 if result["correctness"] else -1.0)
@@ -364,6 +358,7 @@ def reward_speedup(completions, ref_code=None, **kwargs):
     rewards = []
     for response, ref in zip(responses, ref_codes):
         try:
+            # Use get_cached_score which now handles the extraction internally
             result = get_cached_score(response, ref)
             # Reward based on speedup vs eager execution
             # Scale between -1.0 and 10.0 based on performance
@@ -456,28 +451,6 @@ training_args = GRPOConfig(
     reward_weights=[0.2, 0.3, 0.5],  # Weights for compilation, correctness, speedup
 )
 
-# Custom JSON serializer to handle non-serializable objects
-def serialize_for_wandb(obj):
-    """Convert training config to a wandb-compatible dict, handling non-serializable objects."""
-    if hasattr(obj, "__dict__"):
-        return {k: serialize_for_wandb(v) for k, v in obj.__dict__.items() 
-                if not k.startswith("_")}
-    elif isinstance(obj, (list, tuple)):
-        return [serialize_for_wandb(x) for x in obj]
-    elif isinstance(obj, dict):
-        return {k: serialize_for_wandb(v) for k, v in obj.items()}
-    elif hasattr(obj, "to_dict"):
-        try:
-            return serialize_for_wandb(obj.to_dict())
-        except:
-            return str(obj)
-    else:
-        # For objects that can't be serialized, convert to string
-        try:
-            return obj
-        except:
-            return str(obj)
-
 if accelerator.is_main_process:
     try:
         # Use a custom serializer to handle non-serializable objects
@@ -492,12 +465,21 @@ if accelerator.is_main_process:
 
 # Custom callback to clear benchmark cache after each batch
 class BenchmarkCacheCallback(TrainerCallback):
+    def __init__(self, content_cache_max_size=5000):
+        self.content_cache_max_size = content_cache_max_size
+    
     def on_step_end(self, args, state, control, **kwargs):
-        # Ensure we clear the cache after each step
+        # Ensure we clear the benchmark cache after each step
         clear_benchmark_cache()
-        # Also periodically clear the content cache to avoid memory leaks
-        if state.global_step % 10 == 0:
+        
+        # Only clear content cache if it grows too large
+        if len(content_cache) > self.content_cache_max_size:
+            if accelerator.is_main_process and args.debug:
+                print(f"Clearing content cache (size: {len(content_cache)})")
             content_cache.clear()
+            
+            # Also clear the LRU cache for call_benchmark_server_cached
+            call_benchmark_server_cached.cache_clear()
 
 # Initialize the trainer
 trainer = GRPOTrainer(
