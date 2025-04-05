@@ -128,6 +128,7 @@ You are an expert in CUDA kernel optimization and GPU programming. Your task is 
 ## 1. Correctness:
 - Will the CUDA kernel produce exactly the same outputs as the reference PyTorch implementation?
 - Identify any logical errors, indexing issues, off-by-one errors, or data race conditions.
+- Be aggressive, if the code is incorrect and would not produce the same output as the reference PyTorch implementation, give a score of 0.
 
 ## 2. Code Quality:
 - Is the CUDA kernel code clean, readable, maintainable, and well-documented?
@@ -267,8 +268,8 @@ Reply in JSON format with the following fields:
 class LLMKernelEvaluation(BaseModel):
     """The LLM evaluation response for the Cuda Kernel"""
     analysis: str = Field(description="Detailed analysis of the generated CUDA kernel.")
-    correctness: float = Field(description="Correctness score from 0.0 to 1.0, where 1.0 is perfectly correct")
-    code_quality: float = Field(description="Code quality score from 0.0 to 1.0, where 1.0 is excellent quality")
+    correctness: float = Field(description="Correctness score from 0 to 1.0, where 1.0 is perfectly correct")
+    code_quality: float = Field(description="Code quality score from 0 to 1.0, where 1.0 is excellent quality")
 
 
 @dataclass
@@ -279,7 +280,7 @@ class Args:
     dataset_name: str = "tcapelle/cuda-optimized-models"#"GPUMODE/Inductor_Created_Data_Permissive"
     code_column: str = "pytorch_code"
     max_samples: int = None # debug parameter
-    hard_score_percentage: float = 0.1  # Percentage of samples to use hard scoring (benchmark server)
+    hard_score_percentage: float = 0.0  # Percentage of samples to use hard scoring (benchmark server)
     llm_evaluator_model: str = "gpt-4o"  # Model to use for soft scoring
     llm_reward_weight: float = 0.0  # Weight for the LLM-based reward relative to benchmark rewards
 
@@ -655,7 +656,7 @@ def reward_llm_scoring(completions, ref_code, **kwargs):
             quality_score = result["code_quality"]
             
             # Combined reward with more weight on correctness
-            reward = correctness_score + quality_score
+            reward = min(correctness_score, quality_score)
             
             return reward
         except Exception as e:
